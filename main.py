@@ -2,15 +2,15 @@ from bs4 import BeautifulSoup
 from pathlib import Path
 from urllib3 import PoolManager
 import time
-import pandas as pd
 import re
 import json
 
 http = PoolManager()
-
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+}
 OUT_DIR = Path(__file__).resolve().parent / 'raw'
-SEASON = 22
-ARCHIVE_URL = f"https://www.j-archive.com/showseason.php?season={SEASON}"
+ARCHIVE_URL = 'https://www.j-archive.com/listseasons.php'
 
 MONTHS_TABLE = { 
     month : idx for idx, month in enumerate(
@@ -25,11 +25,47 @@ MONTHS_TABLE = {
 def get_show_url(game_id: int) -> str:
     return f"https://www.j-archive.com/showgame.php?game_id={game_id}"
 
+def get_archive_url(season: str) -> str:
+    return f"https://www.j-archive.com/showseason.php?season={season}"
+
 def request_handler(target_url: str) -> str | None:
-    response = http.request('GET', target_url)
+    response = http.request('GET', target_url, headers=HEADERS)
     if response.status == 200:
         return response.data.decode('utf-8')
     return None
+
+def scan_season(html: str) -> list[str] | None:
+    parser = BeautifulSoup(html, 'html.parser')
+    rows = parser.select('table tr')
+    
+    season_data = []
+    
+    for row in rows:
+        link = row.select_one('td:nth-child(1) a')
+        date_col = row.select_one('.left_padded')
+        
+        if link and date_col:
+            href = link.get('href', '')
+            if 'season=' in href:
+                season = href.split('season=')[-1]
+                
+                pattern = r'(\d{4})-(\d{2})-(\d{2})\sto\s(\d{4})-(\d{2})-(\d{2})'
+                matched = re.search(pattern, date_col.text)
+                
+                if matched:
+                    end_date = f"{matched.group(4)}-{matched.group(5)}-{matched.group(6)}"
+                    season_data.append({
+                        'season': season,
+                        'end_date': end_date
+                    })
+
+    if not season_data:
+        return None
+
+    latest_end_date = max([s['end_date'] for s in season_data])
+    filtered_seasons = [s['season'] for s in season_data if s['end_date'] != latest_end_date]
+    
+    return filtered_seasons
 
 def scan_game_id(html: str) -> list[int] | None:
     parser = BeautifulSoup(html, 'html.parser')
@@ -67,7 +103,8 @@ def scan_show(html: str) -> list[dict]:
 
     rounds_info = [
         ('Jeopardy!', '#jeopardy_round'),
-        ('Double Jeopardy!', '#double_jeopardy_round')
+        ('Double Jeopardy!', '#double_jeopardy_round'),
+        ('Final Jeopardy!', '#final_jeopardy_round')
     ]
 
     for round_name, div_id in rounds_info:
@@ -112,7 +149,7 @@ def scan_show(html: str) -> list[dict]:
                     "air_date": air_date,
                     "round": round_name,
                     "category": categories[col_index] if col_index < len(categories) else "",
-                    "value": value,
+                    "value": f"${value}",
                     "is_daily_double": is_dd,
                     "question": question,
                     "answer": answer,
@@ -137,7 +174,7 @@ def scan_show(html: str) -> list[dict]:
             "air_date": air_date,
             "round": "Final Jeopardy!",
             "category": category,
-            "value": 0,
+            "value": f"${0}",
             "is_daily_double": False,
             "question": question,
             "answer": answer,
@@ -149,34 +186,54 @@ def scan_show(html: str) -> list[dict]:
 def main():
     if not OUT_DIR.exists():
         OUT_DIR.mkdir(parents=True, exist_ok=True)
-        
-    print(f"Fetching season {SEASON}...")
-    html = request_handler(ARCHIVE_URL)
-    game_ids = scan_game_id(html)
     
-    if not game_ids:
-        print("Gagal menemukan game_id.")
+    print("Scanning list of seasons...")
+    seasons = scan_season(request_handler(ARCHIVE_URL))
+    
+    if not seasons:
+        print("Failed to fetching list of seasons.")
         return
 
-    df = pd.DataFrame({'game_id': game_ids})
-    df.to_csv(OUT_DIR / 'jeopardy_game_id.csv', index=False, index_label='index')
-
-    datas = []
-    for game_id in game_ids:
-        print(f"Fetching Show ID {game_id}...")
-        show_html = request_handler(get_show_url(game_id))
-
-        if show_html:
-            show_data = scan_show(show_html)
-            datas.extend(show_data) 
-
-        time.sleep(2) 
-            
-    out_file = OUT_DIR / f'jeopardy_season_{SEASON}.json'
-    with open(out_file, 'w', encoding='utf-8') as f:
-        json.dump(datas, f, indent=4, ensure_ascii=False)
+    with open(OUT_DIR / 'jeopardy_seasons.csv', 'w', encoding='utf-8') as w:
+        w.write('index,season\n')
+        for idx, season in enumerate(seasons):
+            w.write(f"{idx},{season}\n")
+    
+    all_jeopardy_data = []
+    
+    for season in seasons:
+        print(f"Fetching season {season}...")
         
-    print(f"Berhasil ekstrak {len(datas)} clues. Tersimpan di {out_file}")
+        html = request_handler(get_archive_url(season))
+        game_ids = scan_game_id(html)
+        
+        if not game_ids:
+            print(f"Failed to find game_id for season {season}. Skipping to the next season.")
+            continue
+        
+        with open(OUT_DIR / 'jeopardy_games.csv', 'w', encoding='utf-8') as w:
+            w.write('index,game_id\n')
+            for idx, game_id in enumerate(game_ids):
+                w.write(f"{idx},{game_id}\n")
+
+        for game_id in game_ids:
+            print(f"Fetching Show ID {game_id} (Season {season})...")
+            show_html = request_handler(get_show_url(game_id))
+
+            if show_html:
+                show_data = scan_show(show_html)
+                all_jeopardy_data.extend(show_data) 
+
+            time.sleep(2) 
+            
+        print(f"Finished extracting season {season}. Current total data: {len(all_jeopardy_data)} clues.")
+            
+    out_file = OUT_DIR / 'jeopardy.json'
+    print(f"\nAll seasons have finished processing! Saving to {out_file}...")
+    with open(out_file, 'w', encoding='utf-8') as f:
+        json.dump(all_jeopardy_data, f, indent=4, ensure_ascii=False)
+        
+    print(f"Success! A total of {len(all_jeopardy_data)} clues have been neatly saved to jeopardy.json.")
 
 if __name__ == '__main__':
     main()
